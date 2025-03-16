@@ -10,6 +10,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "@huggingface/transformers": "^3.4.0",
     "@progress/kendo-cli": "^1.8.0",
     "@progress/kendo-licensing": "^1.5.1",
     "@progress/kendo-react-buttons": "^10.0.0",

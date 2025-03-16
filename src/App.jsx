@@ -1,9 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { pipeline,env } from '@xenova/transformers';
-import { read_audio } from "@xenova/transformers";
+// import { pipeline,env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.2.0';
+import { env } from '@huggingface/transformers';
+// import { read_audio } from "@xenova/transformers";
+import { FFmpeg  } from '@ffmpeg/ffmpeg';
+import { fetchFile } from '@ffmpeg/util';
+
+import MyWorker from './transcriberWorker?worker'
+
 function App() {
   // Main state variables
-  const [video, setVideo] = useState(null);
+    const [video, setVideo] = useState(null);
   const [videoName, setVideoName] = useState('');
   const [selectedModel, setSelectedModel] = useState('base');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
@@ -25,7 +31,7 @@ function App() {
   const transcriber = useRef(null);
   const canvasRef = useRef(null);
   const contextRef = useRef(null);
-
+  const workerRef = useRef(null);
   useEffect(() => {
     // Configure the environment settings
     env.allowLocalModels = false;
@@ -49,7 +55,7 @@ function App() {
     },
     large: {
       name: 'Whisper-medium',
-      path: 'Xenova/whisper-medium',
+      path: 'distil-whisper/distil-large-v2',
       size: '~1.5GB'
     }
   };
@@ -112,6 +118,132 @@ function App() {
       videoElement.load();
     }
   };
+
+  const extractAudioWithWorklet = async (videoUrl) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        addLog('Starting audio extraction with Audio Worklet');
+        
+        // Create audio context
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        // Fix the path to the audioProcessor module
+        await audioContext.audioWorklet.addModule(new URL('./audioProcessor.js', import.meta.url).href);
+        
+        // Create video element
+        const video = document.createElement('video');
+        video.crossOrigin = 'anonymous';
+        video.src = videoUrl;
+        
+        // Wait for the video to be loaded
+        await new Promise((res) => {
+          video.onloadeddata = res;
+          video.load();
+        });
+        
+        // Create media source from video
+        const source = audioContext.createMediaElementSource(video);
+        
+        // Create audio processor
+        const processor = new AudioWorkletNode(audioContext, 'audio-processor');
+        
+        // Create buffer for audio samples
+        let audioBuffer = [];
+        
+        // Process audio data chunks
+        processor.port.onmessage = (event) => {
+          if (event.data.type === 'buffer') {
+            audioBuffer = audioBuffer.concat(Array.from(event.data.data));
+          }
+        };
+        
+        // Connect nodes
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        
+        // Play video to process audio
+        video.muted = true;
+        await video.play();
+        
+        // Wait for video to finish
+        await new Promise((res) => {
+          video.onended = () => {
+            // Wait a bit to ensure all audio data is processed
+            setTimeout(res, 500);
+          };
+          // Safety timeout
+          setTimeout(res, (video.duration * 1000) + 1000);
+        });
+        
+        // Clean up
+        source.disconnect();
+        processor.disconnect();
+        video.pause();
+        video.remove();
+        
+        addLog('Audio extraction completed');
+        resolve(new Float32Array(audioBuffer));
+        
+      } catch (error) {
+        addLog(`Audio extraction failed: ${error.message}`);
+        reject(error);
+      }
+    });
+  };
+
+  const processAudioInChunks = async (audioBuffer, worker, modelPath, language) => {
+    const chunkDuration = 60; // seconds
+    const sampleRate = 16000; // samples per second
+    const chunkSize = chunkDuration * sampleRate;
+    
+    if (audioBuffer.length > chunkSize) {
+      addLog(`Audio is long (${Math.round(audioBuffer.length / sampleRate)} seconds), processing in chunks...`);
+      
+      // Send each chunk
+      for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+        const end = Math.min(i + chunkSize, audioBuffer.length);
+        const chunk = audioBuffer.slice(i, end);
+        const chunkBuffer = chunk.buffer.slice();
+        
+        addLog(`Processing chunk ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(audioBuffer.length/chunkSize)}`);
+        
+        worker.postMessage({
+          type: 'chunk',
+          modelPath,
+          chunkIndex: Math.floor(i/chunkSize),
+          totalChunks: Math.ceil(audioBuffer.length/chunkSize),
+          audioBuffer: chunk,
+          startTime: i / sampleRate,
+          language
+        }, [chunkBuffer]);
+        
+        // Wait for this chunk to be processed before sending the next
+        await new Promise(resolve => {
+          const chunkListener = (event) => {
+            if (event.data.type === 'chunkComplete' && 
+                event.data.chunkIndex === Math.floor(i/chunkSize)) {
+              worker.removeEventListener('message', chunkListener);
+              resolve();
+            }
+          };
+          worker.addEventListener('message', chunkListener);
+        });
+      }
+      
+      // Tell worker we're done sending chunks
+      worker.postMessage({ type: 'allChunksComplete', modelPath });
+      
+    } else {
+      // Send the entire buffer if small enough
+      worker.postMessage({ 
+        type: 'fullAudio',
+        modelPath,
+        audioBuffer, 
+        language
+      }, [audioBuffer.buffer.slice()]);
+    }
+  };
+
   const generateSubtitles = async () => {
     try {
       setIsModelLoading(true);
@@ -120,39 +252,85 @@ function App() {
       
       const modelPath = selectedModel === 'base' 
         ? 'Xenova/whisper-tiny' 
-        : 'Xenova/whisper-large-v2';
+        : 'distil-whisper/distil-large-v2';
       
-      addLog(`Attempting to load model: ${modelPath}`);
+      addLog(`Initializing Web Worker for model: ${modelPath}`);
       
-      // Attempt to load the model
-      transcriber.current = await pipeline(
-        'automatic-speech-recognition', 
-        modelPath,
-        {
-          progress_callback: (progress) => {
-            if (!isNaN(progress) && progress !== null) {
-              const progressPercent = Math.round(progress * 100);
-              setModelLoadingProgress(progressPercent);
-              addLog(`Model loading: ${progressPercent}%`);
-            }
-          },
-          chunk_length_s: 30,
-          stride_length_s: 5,
-          quantized: true
+      if (!workerRef.current) {
+        try {
+          workerRef.current = new MyWorker(
+            new URL('./transcriberWorker.js', import.meta.url).href, 
+            { type: 'module' }
+          );
+          
+          addLog('Worker successfully initialized');
+        } catch (error) {
+          addLog(`Worker initialization error: ${error.message}`);
+          console.error('Worker initialization error:', error);
+          // Fallback to non-worker method if available
         }
-      );
-      
-      setIsModelLoading(false);
-      addLog('Model loaded successfully');
-      
-      // Check if video is loaded
-      if (videoRef.current && videoRef.current.readyState >= 2) {
-        await processVideo();
-      } else {
-        addLog('Video not yet loaded. Please wait and try again.');
-        alert('Video not yet loaded. Please wait and try again.');
-        setShowSetupScreen(true); // Return to setup screen
       }
+      
+      const worker = workerRef.current;
+      worker.onerror = (error) => {
+        console.error('Worker error:', error);
+        addLog('Worker error: ' + error.message);
+      };
+      
+      // Use the new Audio Worklet method instead of FFmpeg
+      const audioBuffer = await extractAudioWithWorklet(videoRef.current.src);
+      addLog('Extracted audio from video using Audio Worklet');
+
+      // Use chunking approach
+      await processAudioInChunks(audioBuffer, worker, modelPath, selectedLanguage);
+
+      // Check audio buffer size
+      if (audioBuffer.length > 16000 * 60 * 5) { // More than 5 minutes @ 16kHz
+        addLog(`Warning: Audio is large (${Math.round(audioBuffer.length / 16000)} seconds), processing may take longer`);
+      }
+
+      // Handle messages from worker
+      worker.onmessage = (event) => {
+        const { type, message, value, subtitles } = event.data;
+        
+        console.log('Worker message received:', event.data);
+
+        if (type === 'log') addLog(message);
+        if (type === 'progress') {
+          setModelLoadingProgress(value);
+          // Add processing progress update for transcription stage
+          if (message && message.includes('transcription')) {
+            setIsProcessing(true);
+            setProcessingProgress(value);
+          }
+        }
+        if (type === 'error') {
+            addLog(`Error: ${message}`);
+            console.error('Worker error:', message);
+            alert(`Error: ${message}`);
+            setShowSetupScreen(true);
+        }
+        if (type === 'result') {
+            setSubtitles(subtitles);
+            setIsModelLoading(false); 
+            addLog(`Generated ${subtitles.length} subtitle segments`);
+            setProcessingProgress(100);
+            setIsProcessing(false);
+        }
+      };
+
+      // Add a timeout to detect stalled processing
+      const processingTimeout = setTimeout(() => {
+        if (isModelLoading) {
+          addLog("Processing appears to be stalled. The audio might be too large or complex.");
+          alert("Processing timed out. Please try with a shorter video or the smaller model.");
+          setIsModelLoading(false);
+          setShowSetupScreen(true);
+        }
+      }, 120000); // 2 minute timeout
+
+      // Clear timeout when component unmounts or when processing completes
+      return () => clearTimeout(processingTimeout);
       
     } catch (error) {
       setIsModelLoading(false);
@@ -192,15 +370,18 @@ function App() {
       addLog(`Audio extracted. Processing with Whisper model...`);
       setProcessingProgress(50);
       
+      
+
       // Process the audio with the Whisper model
       const result = await transcriber.current(audioData,{
         
         language: selectedLanguage,
         task: 'transcribe',
         return_timestamps: true,
-        chunk_length_s: 30, // Process in 30-second chunks
-        stride_length_s: 5,  // (Optional) Overlapping stride for smooth transition
+        chunk_length_s: 5, // Process in 30-second chunks
+        stride_length_s: 2,  // (Optional) Overlapping stride for smooth transition
       });
+      console.log(result);
       
       addLog('Transcription complete. Processing results...');
       
@@ -251,6 +432,7 @@ function App() {
   };
   
   
+
   // Format time for display (HH:MM:SS,mmm)
   const formatSRTTime = (seconds) => {
     if (isNaN(seconds)) seconds = 0;
