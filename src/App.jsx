@@ -1,15 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-// import { pipeline,env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.2.0';
-import { env } from '@huggingface/transformers';
-// import { read_audio } from "@xenova/transformers";
-import { FFmpeg  } from '@ffmpeg/ffmpeg';
-import { fetchFile } from '@ffmpeg/util';
 
+import { env } from '@huggingface/transformers';
+import {  fetchFile } from '@ffmpeg/util';
+// import createFFmpeg from '@ffmpeg/ffmpeg';
 import MyWorker from './transcriberWorker?worker'
+import { FFmpeg } from '@ffmpeg/ffmpeg';
 
 function App() {
   // Main state variables
-    const [video, setVideo] = useState(null);
+  const [video, setVideo] = useState(null);
   const [videoName, setVideoName] = useState('');
   const [selectedModel, setSelectedModel] = useState('base');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
@@ -119,76 +118,90 @@ function App() {
     }
   };
 
-  const extractAudioWithWorklet = async (videoUrl) => {
-    return new Promise(async (resolve, reject) => {
-      try {
-        addLog('Starting audio extraction with Audio Worklet');
-        
-        // Create audio context
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        
-        // Fix the path to the audioProcessor module
-        await audioContext.audioWorklet.addModule(new URL('./audioProcessor.js', import.meta.url).href);
-        
-        // Create video element
-        const video = document.createElement('video');
-        video.crossOrigin = 'anonymous';
-        video.src = videoUrl;
-        
-        // Wait for the video to be loaded
-        await new Promise((res) => {
-          video.onloadeddata = res;
-          video.load();
-        });
-        
-        // Create media source from video
-        const source = audioContext.createMediaElementSource(video);
-        
-        // Create audio processor
-        const processor = new AudioWorkletNode(audioContext, 'audio-processor');
-        
-        // Create buffer for audio samples
-        let audioBuffer = [];
-        
-        // Process audio data chunks
-        processor.port.onmessage = (event) => {
-          if (event.data.type === 'buffer') {
-            audioBuffer = audioBuffer.concat(Array.from(event.data.data));
-          }
-        };
-        
-        // Connect nodes
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-        
-        // Play video to process audio
-        video.muted = true;
-        await video.play();
-        
-        // Wait for video to finish
-        await new Promise((res) => {
-          video.onended = () => {
-            // Wait a bit to ensure all audio data is processed
-            setTimeout(res, 500);
-          };
-          // Safety timeout
-          setTimeout(res, (video.duration * 1000) + 1000);
-        });
-        
-        // Clean up
-        source.disconnect();
-        processor.disconnect();
-        video.pause();
-        video.remove();
-        
-        addLog('Audio extraction completed');
-        resolve(new Float32Array(audioBuffer));
-        
-      } catch (error) {
-        addLog(`Audio extraction failed: ${error.message}`);
-        reject(error);
+  
+  const extractAudioWithFFmpeg = async (videoUrl) => {
+    try {
+      addLog('Starting audio extraction with ffmpeg.wasm');
+      
+      // Create FFmpeg instance
+      const ffmpeg = new FFmpeg({
+        log: true,
+        logger: (log) => {
+          addLog(`FFmpeg: ${log.message}`);
+          console.log('FFmpeg log:', log);
+        },
+        progress: (progress) => {
+          const percent = Math.round(progress.ratio * 100);
+          addLog(`FFmpeg progress: ${percent}%`);
+          setProcessingProgress(percent);
+        }
+      });
+      
+      // Load ffmpeg with timeout
+      const loadPromise = ffmpeg.load();
+      
+      // Increase timeout to 60 seconds to give more time for loading
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('FFmpeg loading timed out after 60 seconds')), 60000);
+      });
+      
+      await Promise.race([loadPromise, timeoutPromise]);
+      addLog('FFmpeg loaded successfully');
+      
+      // Fetch the video file
+      addLog('Fetching video data');
+      const videoData = await fetchFile(videoUrl);
+      addLog(`Video data fetched: ${videoData.byteLength} bytes`);
+      
+      // Write the video to FFmpeg's virtual file system
+      addLog('Writing video to FFmpeg virtual filesystem');
+      await ffmpeg.writeFile('input.mp4', videoData);
+      addLog('Video written to FFmpeg virtual filesystem');
+      
+      // Extract audio and convert to wav at 16kHz
+      addLog('Starting audio extraction');
+      await ffmpeg.exec([
+        '-i', 'input.mp4',
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        'output.wav'
+      ]);
+      addLog('Audio extraction complete');
+      
+      // Read the result
+      addLog('Reading extracted audio file');
+      const data = await ffmpeg.readFile('output.wav');
+      addLog(`Audio data read: ${data.byteLength} bytes`);
+      
+      // Clean up files
+      await ffmpeg.deleteFile('input.mp4');
+      await ffmpeg.deleteFile('output.wav');
+      
+      // Convert WAV data to Float32Array
+      addLog('Converting WAV data to Float32Array');
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const audioBuffer = await audioContext.decodeAudioData(data.buffer);
+      const audioData = audioBuffer.getChannelData(0);
+      
+      addLog('Audio extraction complete with ffmpeg.wasm');
+      return audioData;
+    } catch (error) {
+      addLog(`FFmpeg extraction failed: ${error.message}`);
+      console.error('FFmpeg detailed error:', error);
+      
+      // Provide more detailed error information
+      if (error.message.includes('timed out')) {
+        addLog('FFmpeg loading timed out. Please check your internet connection and try again.');
+      } else if (error.message.includes('Failed to fetch')) {
+        addLog('Failed to fetch FFmpeg resources. Please check your internet connection and try again.');
+      } else {
+        addLog('An unexpected error occurred during FFmpeg processing.');
       }
-    });
+      
+      throw error;
+    }
   };
 
   const processAudioInChunks = async (audioBuffer, worker, modelPath, language) => {
@@ -196,51 +209,57 @@ function App() {
     const sampleRate = 16000; // samples per second
     const chunkSize = chunkDuration * sampleRate;
     
-    if (audioBuffer.length > chunkSize) {
-      addLog(`Audio is long (${Math.round(audioBuffer.length / sampleRate)} seconds), processing in chunks...`);
-      
-      // Send each chunk
-      for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-        const end = Math.min(i + chunkSize, audioBuffer.length);
-        const chunk = audioBuffer.slice(i, end);
-        const chunkBuffer = chunk.buffer.slice();
+    try {
+      if (audioBuffer.length > chunkSize) {
+        addLog(`Audio is long (${Math.round(audioBuffer.length / sampleRate)} seconds), processing in chunks...`);
         
-        addLog(`Processing chunk ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(audioBuffer.length/chunkSize)}`);
+        // Send each chunk
+        for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+          const end = Math.min(i + chunkSize, audioBuffer.length);
+          const chunk = audioBuffer.slice(i, end);
+          const chunkBuffer = chunk.buffer.slice();
+          
+          addLog(`Processing chunk ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(audioBuffer.length/chunkSize)}`);
+          
+          worker.postMessage({
+            type: 'chunk',
+            modelPath,
+            chunkIndex: Math.floor(i/chunkSize),
+            totalChunks: Math.ceil(audioBuffer.length/chunkSize),
+            audioBuffer: chunk,
+            startTime: i / sampleRate,
+            language
+          }, [chunkBuffer]);
+          
+          // Wait for this chunk to be processed before sending the next
+          await new Promise(resolve => {
+            const chunkListener = (event) => {
+              if (event.data.type === 'chunkComplete' && 
+                  event.data.chunkIndex === Math.floor(i/chunkSize)) {
+                worker.removeEventListener('message', chunkListener);
+                resolve();
+              }
+            };
+            worker.addEventListener('message', chunkListener);
+          });
+        }
         
-        worker.postMessage({
-          type: 'chunk',
+        // Tell worker we're done sending chunks
+        worker.postMessage({ type: 'allChunksComplete', modelPath });
+        
+      } else {
+        // Send the entire buffer if small enough
+        addLog(`Processing audio as a single chunk (${Math.round(audioBuffer.length / sampleRate)} seconds)`);
+        worker.postMessage({ 
+          type: 'fullAudio',
           modelPath,
-          chunkIndex: Math.floor(i/chunkSize),
-          totalChunks: Math.ceil(audioBuffer.length/chunkSize),
-          audioBuffer: chunk,
-          startTime: i / sampleRate,
+          audioBuffer, 
           language
-        }, [chunkBuffer]);
-        
-        // Wait for this chunk to be processed before sending the next
-        await new Promise(resolve => {
-          const chunkListener = (event) => {
-            if (event.data.type === 'chunkComplete' && 
-                event.data.chunkIndex === Math.floor(i/chunkSize)) {
-              worker.removeEventListener('message', chunkListener);
-              resolve();
-            }
-          };
-          worker.addEventListener('message', chunkListener);
-        });
+        }, [audioBuffer.buffer.slice()]);
       }
-      
-      // Tell worker we're done sending chunks
-      worker.postMessage({ type: 'allChunksComplete', modelPath });
-      
-    } else {
-      // Send the entire buffer if small enough
-      worker.postMessage({ 
-        type: 'fullAudio',
-        modelPath,
-        audioBuffer, 
-        language
-      }, [audioBuffer.buffer.slice()]);
+    } catch (error) {
+      addLog(`Error processing audio chunks: ${error.message}`);
+      throw error; // Re-throw to be caught by the parent function
     }
   };
 
@@ -275,21 +294,11 @@ function App() {
       worker.onerror = (error) => {
         console.error('Worker error:', error);
         addLog('Worker error: ' + error.message);
+        setIsModelLoading(false);
+        setShowSetupScreen(true);
       };
       
-      // Use the new Audio Worklet method instead of FFmpeg
-      const audioBuffer = await extractAudioWithWorklet(videoRef.current.src);
-      addLog('Extracted audio from video using Audio Worklet');
-
-      // Use chunking approach
-      await processAudioInChunks(audioBuffer, worker, modelPath, selectedLanguage);
-
-      // Check audio buffer size
-      if (audioBuffer.length > 16000 * 60 * 5) { // More than 5 minutes @ 16kHz
-        addLog(`Warning: Audio is large (${Math.round(audioBuffer.length / 16000)} seconds), processing may take longer`);
-      }
-
-      // Handle messages from worker
+      // Set up message handler before sending data to worker
       worker.onmessage = (event) => {
         const { type, message, value, subtitles } = event.data;
         
@@ -308,6 +317,7 @@ function App() {
             addLog(`Error: ${message}`);
             console.error('Worker error:', message);
             alert(`Error: ${message}`);
+            setIsModelLoading(false);
             setShowSetupScreen(true);
         }
         if (type === 'result') {
@@ -318,6 +328,15 @@ function App() {
             setIsProcessing(false);
         }
       };
+      
+      // Use the new Audio Worklet method instead of FFmpeg
+      const audioBuffer =  await extractAudioWithFFmpeg(videoRef.current.src);
+      console.log(audioBuffer);
+      
+      addLog('Extracted audio from video using Audio Worklet');
+
+      // Use chunking approach
+      await processAudioInChunks(audioBuffer, worker, modelPath, selectedLanguage);
 
       // Add a timeout to detect stalled processing
       const processingTimeout = setTimeout(() => {
@@ -343,94 +362,6 @@ function App() {
     }
   };
 
-  const processVideo = async () => {
-    if (!videoRef.current || !transcriber.current) {
-      addLog('Video reference or transcriber not available');
-      return;
-    }
-    
-    setIsProcessing(true);
-    setProcessingProgress(0);
-    addLog('Starting video processing...');
-    
-    try {
-      const video = videoRef.current;
-      addLog('Extracting audio from video...');
-      
-      // Get the video URL
-      const videoURL = video.src;
-      
-      // Extract audio using the read_audio function from @xenova/transformers
-      // This is what was missing in your implementation
-      const audioData = await read_audio(videoURL, 16000); // 16kHz is what Whisper expects
-      
-      
-      
-      
-      addLog(`Audio extracted. Processing with Whisper model...`);
-      setProcessingProgress(50);
-      
-      
-
-      // Process the audio with the Whisper model
-      const result = await transcriber.current(audioData,{
-        
-        language: selectedLanguage,
-        task: 'transcribe',
-        return_timestamps: true,
-        chunk_length_s: 5, // Process in 30-second chunks
-        stride_length_s: 2,  // (Optional) Overlapping stride for smooth transition
-      });
-      console.log(result);
-      
-      addLog('Transcription complete. Processing results...');
-      
-      // Process the results and create subtitle entries
-      const subtitleEntries = [];
-      
-      if (result && result.chunks) {
-        // For Whisper model that returns chunks with timestamps
-        result.chunks.forEach((chunk, index) => {
-          subtitleEntries.push({
-            id: index + 1,
-            start: chunk.timestamp[0],
-            end: chunk.timestamp[1],
-            text: chunk.text.trim(),
-            font: subtitleFont,
-            fontSize: subtitleFontSize,
-            color: subtitleColor
-          });
-        });
-      } else if (result && result.text) {
-        // For models that don't return chunk timestamps, use the whole text
-        subtitleEntries.push({
-          id: 1,
-          start: 0,
-          end: video.duration,
-          text: result.text.trim(),
-          font: subtitleFont,
-          fontSize: subtitleFontSize,
-          color: subtitleColor
-        });
-      }
-      
-      // Set the subtitles
-      setSubtitles(subtitleEntries);
-      addLog(`Generated ${subtitleEntries.length} subtitle segments`);
-      
-      // Reset video to original state
-      video.currentTime = 0;
-      
-      setProcessingProgress(100);
-      
-    } catch (error) {
-      addLog(`Error processing video: ${error.message}`);
-      console.error('Error details:', error);
-    }
-    
-    setIsProcessing(false);
-  };
-  
   
 
   // Format time for display (HH:MM:SS,mmm)
