@@ -119,249 +119,141 @@ function App() {
   };
 
   
-  const extractAudioWithFFmpeg = async (videoUrl) => {
-    try {
-      addLog('Starting audio extraction with ffmpeg.wasm');
-      
-      // Create FFmpeg instance
-      const ffmpeg = new FFmpeg({
-        log: true,
-        logger: (log) => {
-          addLog(`FFmpeg: ${log.message}`);
-          console.log('FFmpeg log:', log);
-        },
-        progress: (progress) => {
-          const percent = Math.round(progress.ratio * 100);
-          addLog(`FFmpeg progress: ${percent}%`);
-          setProcessingProgress(percent);
-        }
-      });
-      
-      // Load ffmpeg with timeout
-      const loadPromise = ffmpeg.load();
-      
-      // Increase timeout to 60 seconds to give more time for loading
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('FFmpeg loading timed out after 60 seconds')), 60000);
-      });
-      
-      await Promise.race([loadPromise, timeoutPromise]);
-      addLog('FFmpeg loaded successfully');
-      
-      // Fetch the video file
-      addLog('Fetching video data');
-      const videoData = await fetchFile(videoUrl);
-      addLog(`Video data fetched: ${videoData.byteLength} bytes`);
-      
-      // Write the video to FFmpeg's virtual file system
-      addLog('Writing video to FFmpeg virtual filesystem');
-      await ffmpeg.writeFile('input.mp4', videoData);
-      addLog('Video written to FFmpeg virtual filesystem');
-      
-      // Extract audio and convert to wav at 16kHz
-      addLog('Starting audio extraction');
-      await ffmpeg.exec([
-        '-i', 'input.mp4',
-        '-vn',
-        '-acodec', 'pcm_s16le',
-        '-ar', '16000',
-        '-ac', '1',
-        'output.wav'
-      ]);
-      addLog('Audio extraction complete');
-      
-      // Read the result
-      addLog('Reading extracted audio file');
-      const data = await ffmpeg.readFile('output.wav');
-      addLog(`Audio data read: ${data.byteLength} bytes`);
-      
-      // Clean up files
-      await ffmpeg.deleteFile('input.mp4');
-      await ffmpeg.deleteFile('output.wav');
-      
-      // Convert WAV data to Float32Array
-      addLog('Converting WAV data to Float32Array');
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const audioBuffer = await audioContext.decodeAudioData(data.buffer);
-      const audioData = audioBuffer.getChannelData(0);
-      
-      addLog('Audio extraction complete with ffmpeg.wasm');
-      return audioData;
-    } catch (error) {
-      addLog(`FFmpeg extraction failed: ${error.message}`);
-      console.error('FFmpeg detailed error:', error);
-      
-      // Provide more detailed error information
-      if (error.message.includes('timed out')) {
-        addLog('FFmpeg loading timed out. Please check your internet connection and try again.');
-      } else if (error.message.includes('Failed to fetch')) {
-        addLog('Failed to fetch FFmpeg resources. Please check your internet connection and try again.');
-      } else {
-        addLog('An unexpected error occurred during FFmpeg processing.');
-      }
-      
-      throw error;
-    }
-  };
-
-  const processAudioInChunks = async (audioBuffer, worker, modelPath, language) => {
-    const chunkDuration = 60; // seconds
-    const sampleRate = 16000; // samples per second
-    const chunkSize = chunkDuration * sampleRate;
+  // Fallback function using Web Audio API
+const extractAudioWithWebAudio = async (videoUrl) => {
+  try {
+    addLog('Starting audio extraction with Web Audio API (fallback)');
     
-    try {
-      if (audioBuffer.length > chunkSize) {
-        addLog(`Audio is long (${Math.round(audioBuffer.length / sampleRate)} seconds), processing in chunks...`);
-        
-        // Send each chunk
-        for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-          const end = Math.min(i + chunkSize, audioBuffer.length);
-          const chunk = audioBuffer.slice(i, end);
-          const chunkBuffer = chunk.buffer.slice();
-          
-          addLog(`Processing chunk ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(audioBuffer.length/chunkSize)}`);
-          
-          worker.postMessage({
-            type: 'chunk',
-            modelPath,
-            chunkIndex: Math.floor(i/chunkSize),
-            totalChunks: Math.ceil(audioBuffer.length/chunkSize),
-            audioBuffer: chunk,
-            startTime: i / sampleRate,
-            language
-          }, [chunkBuffer]);
-          
-          // Wait for this chunk to be processed before sending the next
-          await new Promise(resolve => {
-            const chunkListener = (event) => {
-              if (event.data.type === 'chunkComplete' && 
-                  event.data.chunkIndex === Math.floor(i/chunkSize)) {
-                worker.removeEventListener('message', chunkListener);
-                resolve();
-              }
-            };
-            worker.addEventListener('message', chunkListener);
-          });
-        }
-        
-        // Tell worker we're done sending chunks
-        worker.postMessage({ type: 'allChunksComplete', modelPath });
-        
-      } else {
-        // Send the entire buffer if small enough
-        addLog(`Processing audio as a single chunk (${Math.round(audioBuffer.length / sampleRate)} seconds)`);
-        worker.postMessage({ 
-          type: 'fullAudio',
-          modelPath,
-          audioBuffer, 
-          language
-        }, [audioBuffer.buffer.slice()]);
-      }
-    } catch (error) {
-      addLog(`Error processing audio chunks: ${error.message}`);
-      throw error; // Re-throw to be caught by the parent function
+    // Fetch the video
+    const response = await fetch(videoUrl);
+    const arrayBuffer = await response.arrayBuffer();
+    
+    // Create an AudioContext
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Decode the audio data
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    
+    // Resample to 16kHz if necessary
+    if (audioBuffer.sampleRate !== 16000) {
+      addLog('Resampling audio to 16kHz');
+      const offlineContext = new OfflineAudioContext(1, audioBuffer.duration * 16000, 16000);
+      const source = offlineContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(offlineContext.destination);
+      source.start();
+      const resampledBuffer = await offlineContext.startRendering();
+      return new Float32Array(resampledBuffer.getChannelData(0));
     }
-  };
-
-  const generateSubtitles = async () => {
-    try {
-      setIsModelLoading(true);
-      setModelLoadingProgress(0);
-      setShowSetupScreen(false);
+    
+    // Return the audio data as Float32Array
+    addLog('Audio extraction complete with Web Audio API');
+    return new Float32Array(audioBuffer.getChannelData(0));
+  } catch (error) {
+    addLog(`Web Audio API extraction failed: ${error.message}`);
+    console.error('Web Audio API detailed error:', error);
+    throw error;
+  }
+};
+const generateSubtitles = async () => {
+  try {
+    setIsModelLoading(true);
+    setModelLoadingProgress(0);
+    setShowSetupScreen(false);
+    
+    const modelPath = selectedModel === 'base' 
+      ? 'Xenova/whisper-tiny' 
+      : 'distil-whisper/distil-large-v2';
+    
+    addLog(`Initializing Parallel Transcription Manager for model: ${modelPath}`);
+    
+    // Create a new ParallelTranscriptionManager instead of a single worker
+    const numWorkers = navigator.hardwareConcurrency || 4;
+    addLog(`Using ${numWorkers} workers for parallel processing`);
+    
+    import('./TranscriptionManager.js').then(async (module) => {
+      const ParallelTranscriptionManager = module.default;
+      const transcriptionManager = new ParallelTranscriptionManager(
+        modelPath,
+        selectedLanguage,
+        numWorkers
+      ).initialize();
       
-      const modelPath = selectedModel === 'base' 
-        ? 'Xenova/whisper-tiny' 
-        : 'distil-whisper/distil-large-v2';
+      // Set up progress callback
+      transcriptionManager.onProgress((progress, message) => {
+        console.log(`Progress: ${progress}% - ${message}`);
+        if (message.includes('Model loading')) {
+          setModelLoadingProgress(progress);
+        } else {
+          setIsProcessing(true);
+          setProcessingProgress(progress);
+        }
+        addLog(message);
+      });
       
-      addLog(`Initializing Web Worker for model: ${modelPath}`);
+      let audioBuffer;
       
-      if (!workerRef.current) {
         try {
-          workerRef.current = new MyWorker(
-            new URL('./transcriberWorker.js', import.meta.url).href, 
-            { type: 'module' }
-          );
+          audioBuffer = await extractAudioWithWebAudio(videoRef.current.src);
+          addLog('Extracted audio from video using Web Audio API');
+        } catch (webAudioError) {
+          console.log(webAudioError);
           
-          addLog('Worker successfully initialized');
-        } catch (error) {
-          addLog(`Worker initialization error: ${error.message}`);
-          console.error('Worker initialization error:', error);
-          // Fallback to non-worker method if available
+          addLog('Both extraction methods failed');
+          throw new Error('Audio extraction failed using both FFmpeg and Web Audio API');
         }
-      }
       
-      const worker = workerRef.current;
-      worker.onerror = (error) => {
-        console.error('Worker error:', error);
-        addLog('Worker error: ' + error.message);
-        setIsModelLoading(false);
-        setShowSetupScreen(true);
-      };
       
-      // Set up message handler before sending data to worker
-      worker.onmessage = (event) => {
-        const { type, message, value, subtitles } = event.data;
-        
-        console.log('Worker message received:', event.data);
-
-        if (type === 'log') addLog(message);
-        if (type === 'progress') {
-          setModelLoadingProgress(value);
-          // Add processing progress update for transcription stage
-          if (message && message.includes('transcription')) {
-            setIsProcessing(true);
-            setProcessingProgress(value);
-          }
-        }
-        if (type === 'error') {
-            addLog(`Error: ${message}`);
-            console.error('Worker error:', message);
-            alert(`Error: ${message}`);
-            setIsModelLoading(false);
-            setShowSetupScreen(true);
-        }
-        if (type === 'result') {
-            setSubtitles(subtitles);
-            setIsModelLoading(false); 
-            addLog(`Generated ${subtitles.length} subtitle segments`);
-            setProcessingProgress(100);
-            setIsProcessing(false);
-        }
-      };
-      
-      // Use the new Audio Worklet method instead of FFmpeg
-      const audioBuffer =  await extractAudioWithFFmpeg(videoRef.current.src);
-      console.log(audioBuffer);
-      
-      addLog('Extracted audio from video using Audio Worklet');
-
-      // Use chunking approach
-      await processAudioInChunks(audioBuffer, worker, modelPath, selectedLanguage);
-
-      // Add a timeout to detect stalled processing
+      // Set up timeout for stalled processing
       const processingTimeout = setTimeout(() => {
         if (isModelLoading) {
           addLog("Processing appears to be stalled. The audio might be too large or complex.");
           alert("Processing timed out. Please try with a shorter video or the smaller model.");
           setIsModelLoading(false);
           setShowSetupScreen(true);
+          transcriptionManager.terminate();
         }
       }, 120000); // 2 minute timeout
-
-      // Clear timeout when component unmounts or when processing completes
-      return () => clearTimeout(processingTimeout);
       
-    } catch (error) {
+      try {
+        // Start transcription with parallel processing
+        const subtitles = await transcriptionManager.transcribe(audioBuffer, 16000);
+        
+        setSubtitles(subtitles);
+        setIsModelLoading(false);
+        addLog(`Generated ${subtitles.length} subtitle segments`);
+        setProcessingProgress(100);
+        setIsProcessing(false);
+        
+        // Clean up
+        transcriptionManager.terminate();
+        clearTimeout(processingTimeout);
+      } catch (error) {
+        console.error('Transcription error:', error);
+        addLog(`Transcription error: ${error.message}`);
+        alert(`Error during transcription: ${error.message}`);
+        setIsModelLoading(false);
+        setShowSetupScreen(true);
+        transcriptionManager.terminate();
+        clearTimeout(processingTimeout);
+      }
+    }).catch(error => {
+      console.error('Failed to load ParallelTranscriptionManager:', error);
+      alert(`Failed to initialize parallel processing: ${error.message}`);
       setIsModelLoading(false);
-      addLog(`Error loading model: ${error.message}`);
-      console.error('Detailed error:', error);
-      
-      // Display an alert to the user
-      alert(`Failed to load the model: ${error.message}. Please try again or choose a different model.`);
-      setShowSetupScreen(true); // Return to setup screen on error
-    }
-  };
-
+      setShowSetupScreen(true);
+    });
+    
+  } catch (error) {
+    setIsModelLoading(false);
+    addLog(`Error loading model: ${error.message}`);
+    console.error('Detailed error:', error);
+    
+    // Display an alert to the user
+    alert(`Failed to load the model: ${error.message}. Please try again or choose a different model.`);
+    setShowSetupScreen(true); // Return to setup screen on error
+  }
+};
   
 
   // Format time for display (HH:MM:SS,mmm)
